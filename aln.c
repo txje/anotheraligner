@@ -1,0 +1,757 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019 Jeremy Wang
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#include <getopt.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include "klib/kvec.h" // C dynamic vector
+#include "klib/khash.h"
+#include <zlib.h>
+#include "chain.h"
+
+#ifndef _kseq_
+#define _kseq_
+
+#include "klib/kseq.h"
+
+// init kseq struct
+KSEQ_INIT(gzFile, gzread)
+
+#endif
+
+typedef struct {
+  char* s;
+  uint32_t l;
+} fa_seq;
+
+// map seq name to index into *seq vec
+KHASH_MAP_INIT_STR(faHash, uint32_t)
+
+void version() {
+  printf("Simple dynamic programming aligner\n");
+}
+
+void usage() {
+  printf("Usage: aln [options]\n");
+  printf("Commands:\n");
+  printf("  global: end-to-end query and ref - useful for full-length amplicons, etc.\n");
+  printf("  read-local: end-to-end ref, but query may be partial\n");
+  printf("  ref-local: end-to-end reads, but ref may be partial - this is most useful for read -> reference mapping\n");
+  printf("  local: both may be partial - often reasonable for long-read -> reference mapping\n");
+  printf("Options:\n");
+  printf("  -q: FASTA/Q[.gz] file with reads\n");
+  printf("  -r: Reference FASTA/Q[.gz]\n");
+  printf("  -v, --verbose: verbose\n");
+  printf("  -h, --help: show this\n");
+}
+
+static struct option long_options[] = {
+// if these are the same as a single-character option, put that character in the 4th field instead of 0
+  { "verbose",                no_argument,       0, 'v' },
+  { "help",                   no_argument,       0, 'h' },
+  { 0, 0, 0, 0}
+};
+
+typedef kvec_t(unsigned char) charvec;
+
+typedef struct {
+  uint32_t ref_id;
+  uint32_t pos;
+} ref_pos;
+
+typedef kvec_t(ref_pos) rpvec;
+
+// string (k-mer) to ref/pos
+KHASH_MAP_INIT_STR(kmerHash, rpvec)
+
+typedef struct aln_result {
+  int score;
+  int qstart;
+  int qend;
+  int tstart;
+  int tend;
+  int failed; // boolean flag
+} result;
+
+unsigned char MATCH = 0, INS = 1, DEL = 2, MISMATCH = 3;
+int MATCH_SCORE = 2;
+int MISMATCH_SCORE = -4;
+int GAP_OPEN_1 = -4;
+int GAP_EXTEND_1 = -2;
+int GAP_OPEN_2 = -24;
+int GAP_EXTEND_2 = -1;
+int LOW = -2000000000; // almost the lowest 32-bit integer
+
+float cigar_accuracy(unsigned char *cigar, int cigar_len) {
+  int matches = 0, total = 0;
+  int i;
+  for(i = 0; i < cigar_len; i++) {
+    if(cigar[i] == MATCH) {
+      matches++;
+    }
+    total++;
+  }
+  return ((float)matches) / total;
+}
+
+char* rc(char* s, int l, char compl[256]) {
+  char* r = malloc((l+1) * sizeof(char));
+  int i;
+  for(i = 0; i < l; i++)
+    r[i] = compl[s[l-1-i]];
+  r[i] = '\0';
+  return r;
+}
+
+typedef struct {
+  int score;
+  unsigned char direction;
+  uint16_t gap_size; // supports gaps up to 65Kbp
+} dp_cell;
+
+void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
+  int q = 0;
+  int t = 0;
+  uint32_t qst = 0;
+  uint32_t tst = 0;
+  char* qs = malloc(151 * sizeof(char));
+  char* as = malloc(151 * sizeof(char));
+  char* ts = malloc(151 * sizeof(char));
+  qs[150] = '\0';
+  as[150] = '\0';
+  ts[150] = '\0';
+  int i;
+  for(i = 0; i < kv_size(path); i++) {
+    if(kv_A(path, i) == MATCH) {
+      qs[i%150] = qseq[q++];
+      as[i%150] = '|';
+      ts[i%150] = tseq[t++];
+    } else if(kv_A(path, i) == MISMATCH) {
+      qs[i%150] = qseq[q++];
+      as[i%150] = ' ';
+      ts[i%150] = tseq[t++];
+    } else if(kv_A(path, i) == INS) {
+      qs[i%150] = qseq[q++];
+      as[i%150] = ' ';
+      ts[i%150] = '-';
+    } else if(kv_A(path, i) == DEL) {
+      qs[i%150] = '-';
+      as[i%150] = ' ';
+      ts[i%150] = tseq[t++];
+    }
+    //fprintf(stderr, "i: %u\n", i);
+    if(i%150 == 149 || i == kv_size(path)-1) {
+      if(i == kv_size(path)-1) {
+        qs[i%150+1] = '\0';
+        as[i%150+1] = '\0';
+        ts[i%150+1] = '\0';
+      }
+      fprintf(o, "%10u %s\n", qst, qs);
+      fprintf(o, "%10s %s\n", " ", as);
+      fprintf(o, "%10u %s\n", tst, ts);
+      fprintf(o, "\n");
+      qst = q;
+      tst = t;
+    }
+  }
+  free(qs);
+  free(as);
+  free(ts);
+}
+
+void output_paf(FILE* o, char* qn, int ql, int qs, int qe, char strand, char* tn, int tl, int ts, int te, charvec fullpath) {
+  // minimap2 flags: NM:i:10828    ms:i:21848  AS:i:21066      nn:i:0 tp:A:P                                     cm:i:535   s1:i:5023   s2:i:0 de:f:0.1848 rl:i:0 cg:Z:100M1D100M...
+  //                 edit distance             alignment score        type (P/primary, S/secondary, I/inversion) minimizers chain score                           CIGAR
+  /*
+  fprintf(o, "%s\t", qn);
+  fprintf(o, "%d\t", ql);
+  fprintf(o, "%d\t", qs);
+  fprintf(o, "%d\t", qe);
+  fprintf(o, "%c\t", strand);
+  fprintf(o, "%s\t", tn);
+  fprintf(o, "%d\t", tl);
+  fprintf(o, "%d\t", ts);
+  fprintf(o, "%d\t", te);
+  int num_matches = 0;
+  fprintf(o, "%d\t", num_matches);
+  fprintf(o, "%d\t", kv_size(fullpath));
+  // to match minimap2: mapQ = 40 * (1-f2/f1) * min(1,m/10) * ln(f1) where m is the number of anchors, f1 is the chaining score, f2 is the second best chain score
+  int map_qual = 255;
+  fprintf(o, "%d\t", map_qual);
+  char* flag = "NA";
+  fprintf(o, "%s\n", flag);
+  */
+}
+
+void print_matrix(dp_cell **m, int q0, int q1, int t0, int t1, char* query, char* target) {
+  int x, y;
+  fprintf(stderr, "        ");
+  for(x = t0+1; x <= t1; x++) {
+    fprintf(stderr, "    %c", target[x-1]);
+  }
+  fprintf(stderr, "\n");
+  for(y = q0; y <= q1; y++) {
+    if(y > q0)
+      fprintf(stderr, "%c |", query[y-1]);
+    else
+      fprintf(stderr, "  |");
+    for(x = 0; x <= q1; x++) {
+      fprintf(stderr, m[y][x].score < 0 ? " %c%3d" : "  %c%2d", "MIDX"[m[y][x].direction], m[y][x].score % 100);
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
+// query along y-axis, target along x
+result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec *path, int verbose) {
+
+  if(tlen == 0 || qlen == 0) {
+    result res;
+    res.failed = 1;
+    // other fields are unset and unreliable
+    return res;
+  }
+
+  dp_cell** dp_matrix = malloc((qlen+1) * sizeof(dp_cell*));
+  int i;
+  for(i = 0; i <= qlen; i++) {
+    dp_matrix[i] = malloc((tlen+1) * sizeof(dp_cell));
+  }
+
+  int x, y;
+  int max_x = 0, max_y = 0;
+  int match_score, ins_score, del_score;
+
+  dp_matrix[0][0].score = 0;
+
+  // MUST MATCH ENTIRETY OF BOTH query AND ref
+  for(y = 1; y <= qlen; y++) {
+    dp_matrix[y][0].score = (GAP_OPEN_2 + GAP_EXTEND_2 * (y-1)) > (GAP_OPEN_1 + GAP_EXTEND_1 * (y-1)) ? (GAP_OPEN_2 + GAP_EXTEND_2 * (y-1)) : (GAP_OPEN_1 + GAP_EXTEND_1 * (y-1));
+    dp_matrix[y][0].direction = INS;
+    dp_matrix[y][0].gap_size = y;
+  }
+  for(x = 1; x <= tlen; x++) {
+    dp_matrix[0][x].score = (GAP_OPEN_2 + GAP_EXTEND_2 * (x-1)) > (GAP_OPEN_1 + GAP_EXTEND_1 * (x-1)) ? (GAP_OPEN_2 + GAP_EXTEND_2 * (x-1)) : (GAP_OPEN_1 + GAP_EXTEND_1 * (x-1));
+    dp_matrix[0][x].direction = DEL;
+    dp_matrix[0][x].gap_size = x;
+  }
+
+  for(y = 1; y <= qlen; y++) {
+    for(x = 1; x <= tlen; x++) {
+
+      // match
+      if(query[y-1] == target[x-1]) {
+        match_score = MATCH_SCORE;
+      } else {
+        match_score = MISMATCH_SCORE;
+      }
+      match_score = dp_matrix[y-1][x-1].score + match_score;
+
+      // ins
+      if(dp_matrix[y-1][x].direction == INS) {
+        // check whether gap scores 1 or 2 are better for this size gap
+        ins_score = dp_matrix[y-dp_matrix[y-1][x].gap_size-1][x].score + ((GAP_OPEN_1 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_1 > GAP_OPEN_2 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_2) ? GAP_OPEN_1 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_1 : GAP_OPEN_2 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_2);
+      } else {
+        ins_score = dp_matrix[y-1][x].score + GAP_OPEN_1;
+      }
+
+      // del
+      if(dp_matrix[y][x-1].direction == DEL) {
+        // check whether gap scores 1 or 2 are better for this size gap
+        del_score = dp_matrix[y][x-dp_matrix[y][x-1].gap_size-1].score + ((GAP_OPEN_1 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_1 > GAP_OPEN_2 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_2) ? GAP_OPEN_1 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_1 : GAP_OPEN_2 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_2);
+      } else {
+        del_score = dp_matrix[y][x-1].score + GAP_OPEN_1;
+      }
+
+      // compare
+      if(match_score >= ins_score && match_score >= del_score) {
+        dp_matrix[y][x].score = match_score;
+        if(query[y-1] == target[x-1]) {
+          dp_matrix[y][x].direction = MATCH;
+        } else {
+          dp_matrix[y][x].direction = MISMATCH;
+        }
+        dp_matrix[y][x].gap_size = 0;
+      } else if(ins_score >= del_score) {
+        dp_matrix[y][x].score = ins_score;
+        dp_matrix[y][x].direction = INS;
+        dp_matrix[y][x].gap_size = dp_matrix[y-1][x].direction == INS ? dp_matrix[y-1][x].gap_size + 1 : 1;
+      } else {
+        dp_matrix[y][x].score = del_score;
+        dp_matrix[y][x].direction = DEL;
+        dp_matrix[y][x].gap_size = dp_matrix[y][x-1].direction == DEL ? dp_matrix[y][x-1].gap_size + 1 : 1;
+      }
+    }
+  }
+
+  /*
+  int qst = qlen >= 71 ? 71-30 : (qlen >= 30 ? qlen - 30 : 0);
+  int tmax = tlen > 30 ? 30 : tlen;
+  int qmax = qst + 30 > qlen ? qlen : qst + 30;
+  print_matrix(dp_matrix, qst, qmax, 0, tmax);
+  */
+
+  max_x = tlen;
+  max_y = qlen;
+  // compute maximum score position
+  /*
+  max_x = 0;
+  max_y = qlen;
+  for(x = 1; x < tlen; x++) { // check last row
+    if(dp_matrix[qlen - 1][x].score > dp_matrix[max_y][max_x].score) {
+      max_y = qlen - 1;
+      max_x = x;
+    }
+  }
+  for(y = 0; y < qlen; y++) { // check last column
+    if(dp_matrix[y][tlen - 1].score > dp_matrix[max_y][max_x].score) {
+      max_y = y;
+      max_x = tlen - 1;
+    }
+  }
+  */
+
+  x = max_x;
+  y = max_y;
+  while(x > 0 || y > 0) {
+    kv_push(unsigned char, *path, dp_matrix[y][x].direction);
+    if(dp_matrix[y][x].direction == MATCH || dp_matrix[y][x].direction == MISMATCH) {
+      x--;
+      y--;
+    } else if(dp_matrix[y][x].direction == INS) {
+      y--;
+    } else if(dp_matrix[y][x].direction == DEL) {
+      x--;
+    }
+    if(verbose) {
+      //fprintf(stderr, "  x: %d, y: %d\n", x, y);
+    }
+  }
+
+  result res;
+  res.score = dp_matrix[max_y][max_x].score;
+  res.qstart = y;
+  res.qend = max_y;
+  res.tstart = x;
+  res.tend = max_x;
+  // end positions are INCLUSIVE
+
+  // free these up in case we'll be doing this repeatedly
+  for(i = 0; i < qlen; i++) {
+    free(dp_matrix[i]);
+  }
+  free(dp_matrix);
+
+  return res;
+}
+
+
+int main(int argc, char *argv[]) {
+  char* read_fasta = NULL;
+  char* ref_fasta = NULL;
+  char* method = "kmer";
+  int verbose = 0;
+
+  // ---------- options ----------
+  int opt, long_idx;
+  opterr = 0;
+  while ((opt = getopt_long(argc, argv, "q:r:vh", long_options, &long_idx)) != -1) {
+    switch (opt) {
+      case 'q':
+        read_fasta = optarg;
+        break;
+      case 'r':
+        ref_fasta = optarg;
+        break;
+      case 'v':
+        verbose = 1;
+        break;
+      case 'h':
+        usage();
+        return 0;
+        break;
+      case '?':
+        if (optopt == 'q' || optopt == 'r')
+          fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+        else if (isprint (optopt))
+          fprintf(stderr, "Unknown option `-%c'.\n", optopt);
+        else
+          fprintf(stderr, "Unknown option character `\\x%x'.\n", optopt);
+        return 1;
+      case 0:
+        // as long as all the long arguments have characters too, I don't think this section will be used
+        if (long_idx == 0) verbose = 1; // --verbose
+        else if (long_idx == 1) {usage(); return 0;} // --help
+        break;
+      default:
+        usage();
+        return 1;
+    }
+  }
+
+  int index;
+  char* command = NULL;
+  for (index = optind; index < argc; index++) {
+    if(index == optind) {
+      command = argv[index];
+    }
+  }
+  if(command == NULL) {
+    usage();
+    return 1;
+  }
+
+  if(read_fasta == NULL) {
+    fprintf(stderr, "-q read FASTA/Q[.gz] is required\n");
+    usage();
+    return 1;
+  }
+
+  if(ref_fasta == NULL) {
+    fprintf(stderr, "-r ref FASTA/Q[.gz] is required\n");
+    usage();
+    return 1;
+  }
+
+  int l;
+  uint32_t i, j;
+  int k = 21; // this should be a parameter
+
+  // we'll reuse this vector for each alignment
+  charvec path; // will just point to one of fw/rv
+  charvec fw_path;
+  kv_init(fw_path);
+  charvec rv_path;
+  kv_init(rv_path);
+
+  // set up complement array
+  char compl[256];
+  for(i = 0; i < 256; i++) {
+    compl[i] = 'N';
+  }
+  compl[65] = 'T';
+  compl[67] = 'G';
+  compl[71] = 'C';
+  compl[84] = 'A';
+  compl[97] = 't';
+  compl[99] = 'g';
+  compl[103] = 'c';
+  compl[116] = 'a';
+
+  // ---------- load ref FASTA file ----------
+  gzFile f = gzopen(ref_fasta, "r");
+  kseq_t* seq = kseq_init(f);
+  fprintf(stderr, "Loading ref FASTA file: %s\n", ref_fasta);
+
+  khash_t(faHash) *refmap = kh_init(faHash);
+  kvec_t(fa_seq) refs;
+  kv_init(refs);
+  kvec_t(char*) refnames;
+  kv_init(refnames);
+
+  khint_t bin, bin2; // hash bin (result of kh_put)
+  int absent;
+  char* a;
+  fa_seq fs;
+  fa_seq fn;
+
+  while ((l = kseq_read(seq)) >= 0) {
+    // name: seq->name.s, seq: seq->seq.s, length: l
+    //printf("Reading %s (%i bp).\n", seq->name.s, l);
+
+    // make <seq>
+    fs.s = malloc(sizeof(char)*l);
+    memcpy(fs.s, seq->seq.s, sizeof(char)*l);
+    fs.l = l;
+
+    // add <seq> to refs vector
+    kv_push(fa_seq, refs, fs);
+
+    // add <name>:<refs idx> to refmap
+    a = malloc(strlen(seq->name.s)+1);
+    strcpy(a, seq->name.s);
+    bin = kh_put(faHash, refmap, a, &absent);
+    kh_val(refmap, bin) = kv_size(refs)-1;
+    kv_push(char*, refnames, a);
+  }
+
+  fprintf(stderr, "Loaded %d ref sequences.\n", kv_size(refs));
+
+  kseq_destroy(seq);
+  gzclose(f);
+
+  // ---------- build k-mer hash (kmer : ref/pos) ------------
+  khash_t(kmerHash) *h = kh_init(kmerHash);
+  char *kmer;
+  ref_pos rp;
+  for(i = 0; i < kv_size(refs); i++) {
+    rp.ref_id = i;
+    for(j = 0; j < kv_A(refs, i).l - k + 1; j++) {
+      kmer = malloc((k+1) * sizeof(char));
+      kmer[k] = '\0';
+      memcpy(kmer, kv_A(refs, i).s+j, k);
+      //fprintf(stderr, "%s at %u:%u\n", kmer, i, j);
+      bin = kh_put(kmerHash, h, kmer, &absent);
+      if(absent) {
+        kv_init(kh_val(h, bin));
+      }
+      rp.pos = j;
+      kv_push(ref_pos, kh_val(h, bin), rp);
+    }
+  }
+
+  // ---------- load reads ----------
+  f = gzopen(read_fasta, "r");
+  seq = kseq_init(f);
+  printf("Reading fasta file: %s\n", read_fasta);
+
+  char* rv_kmer;
+  result aln, rv_aln;
+  char strand;
+  char tmp;
+  int n = 0;
+
+  posPair pp;
+  while ((l = kseq_read(seq)) >= 0) {
+    // name: seq->name.s, seq: seq->seq.s, length: l
+    if(verbose) {
+      fprintf(stderr, "Aligning %s (%i bp).\n", seq->name.s, l);
+    }
+
+    if(strcmp(method, "kmer") == 0) {
+      khash_t(matchHash) *hits = kh_init(matchHash);
+      khash_t(matchHash) *rv_hits = kh_init(matchHash);
+
+      for(j = 0; j < l - k + 1; j++) {
+        if(j < l - k) { // except for the very last k-mer, make a fake substring
+          tmp = seq->seq.s[j+k];
+          seq->seq.s[j+k] = '\0';
+        }
+
+        //fprintf(stderr, "%s at %u:%u\n", kmer, i, j);
+        bin = kh_get(kmerHash, h, seq->seq.s+j);
+        if(j < l - k)
+          seq->seq.s[j+k] = tmp;
+        if(bin != kh_end(h)) { // hit something
+          pp.qpos = j;
+          for(i = 0; i < kv_size(kh_val(h, bin)); i++) {
+            bin2 = kh_put(matchHash, hits, kv_A(kh_val(h, bin), i).ref_id, &absent);
+            if(absent) {
+              kv_init(kh_val(hits, bin2));
+            }
+            pp.tpos = kv_A(kh_val(h, bin), i).pos;
+            kv_push(posPair, kh_val(hits, bin2), pp);
+          }
+        }
+
+        // same for rev/compl kmer
+        rv_kmer = rc(seq->seq.s+j, k, compl);
+        bin = kh_get(kmerHash, h, rv_kmer);
+        if(bin != kh_end(h)) { // hit something
+          pp.qpos = l + k - j; // reverse the k-mer position
+          for(i = 0; i < kv_size(kh_val(h, bin)); i++) {
+            bin2 = kh_put(matchHash, rv_hits, kv_A(kh_val(h, bin), i).ref_id, &absent);
+            if(absent) {
+              kv_init(kh_val(rv_hits, bin2));
+            }
+            pp.tpos = kv_A(kh_val(h, bin), i).pos;
+            kv_push(posPair, kh_val(rv_hits, bin2), pp);
+          }
+        }
+        free(rv_kmer);
+      }
+      for(i = kh_begin(hits); i < kh_end(hits); i++) {
+        if(kh_exist(hits, i)) {
+          fprintf(stderr, "ref %u has %u hits\n", kh_key(hits, i), kv_size(kh_val(hits, i)));
+        }
+      }
+      for(i = kh_begin(rv_hits); i < kh_end(rv_hits); i++) {
+        if(kh_exist(rv_hits, i)) {
+          fprintf(stderr, "ref %u (-) has %u hits\n", kh_key(rv_hits, i), kv_size(kh_val(rv_hits, i)));
+        }
+      }
+
+      chain *ch = do_chain(hits, rv_hits, 10000, 4, 10000, 3);
+      for(i = kh_begin(hits); i < kh_end(hits); i++) {
+        if(kh_exist(hits, i)) {
+          kv_destroy(kh_value(hits, i));
+        }
+      }
+      kh_destroy(matchHash, hits);
+      for(i = kh_begin(rv_hits); i < kh_end(rv_hits); i++) {
+        if(kh_exist(rv_hits, i)) {
+          kv_destroy(kh_value(rv_hits, i));
+        }
+      }
+      kh_destroy(matchHash, rv_hits);
+      int f1 = ch[0].score;
+      int f2 = ch[1].score;
+
+      // print all anchor sets
+      if(verbose) {
+        for(i = 0; ; i++) {
+          if(kv_size(ch[i].anchors) > 0) {
+            fprintf(stderr, "ref %u (%c), score %d, anchors:", ch[i].ref, "+-"[ch[i].rv], ch[i].score);
+            for(j = 0; j < kv_size(ch[i].anchors); j++) {
+              fprintf(stderr, " %u:%u", kv_A(ch[i].anchors, j).qpos, kv_A(ch[i].anchors, j).tpos);
+            }
+            fprintf(stderr, "\n");
+          } else {
+            break;
+          }
+        }
+      }
+
+      if(kv_size(ch[0].anchors) == 0) {
+        fprintf(stderr, "No chain (no k-mer hits) for read '%s'\n", seq->name.s);
+        continue;
+      }
+
+      uint32_t q = 0, t = 0;
+
+      int score = 0;
+      charvec fullpath;
+      kv_init(fullpath);
+      uint32_t qe, te;
+      for(j = 0; j <= kv_size(ch[0].anchors); j++) {
+        qe = j < kv_size(ch[0].anchors) ? kv_A(ch[0].anchors, j).qpos : l;
+        te = j < kv_size(ch[0].anchors) ? kv_A(ch[0].anchors, j).tpos : kv_A(refs, ch[0].ref).l;
+        if(qe <= q && te <= t) {
+          // both overlap, they MUST be identical, and they are probably (unless we exclude some [repetitive] k-mers) 1bp apart
+          // add a match for every base they *don't* overlap, up to the end of the read
+          //fprintf(stderr, "inter-kmer match of length %u\n", ((l < qe + k ? l : qe + k)-q));
+          for(i = q; i < (l < qe + k ? l : qe + k); i++)
+            kv_push(unsigned char, fullpath, MATCH);
+        } else {
+          if(qe <= q && te > t) {
+            if(j > 0)
+              for(i = 0; i < (k+qe-q); i++)
+                kv_push(unsigned char, fullpath, MATCH);
+            //fprintf(stderr, "DEL of length %u\n", ((te-t) - (qe-q)));
+            for(i = 0; i < (te-t) - (qe-q); i++)
+              kv_push(unsigned char, fullpath, DEL);
+          } else if(te <= t && qe > q) {
+            if(j > 0)
+              for(i = 0; i < (k+te-t); i++)
+                kv_push(unsigned char, fullpath, MATCH);
+            //fprintf(stderr, "INS of length %u\n", ((qe-q) - (te-t)));
+            for(i = 0; i < (qe-q) - (te-t); i++)
+              kv_push(unsigned char, fullpath, INS);
+          } else {
+            if(j > 0)
+              for(i = 0; i < k; i++)
+                kv_push(unsigned char, fullpath, MATCH);
+            fw_path.n = 0; // reset vector to reuse
+            rv_path.n = 0;
+            if(verbose) {
+              //fprintf(stderr, "aligning q %u-%u to t %u-%u\n", q, qe, t, te);
+            }
+            aln = align_full_matrix(seq->seq.s+q, kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, verbose);
+            score += aln.score;
+            for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
+              kv_push(unsigned char, fullpath, kv_A(fw_path, kv_size(fw_path)-1-i));
+            }
+            //fprintf(stderr, "\n");
+          }
+        }
+        if(j < kv_size(ch[0].anchors)) {
+          q = kv_A(ch[0].anchors, j).qpos + k;
+          t = kv_A(ch[0].anchors, j).tpos + k;
+          //fprintf(stderr, "q %u :: t %u\n", q, t);
+        }
+      }
+
+      //output_paf(seq->name.s, l, qs, qe, "+-"[ch[0].rv], kv_A(refnames, ch[0].ref), kv_A(refs, ch[0].ref).l, ts, te, fullpath);
+      printf("Score: %d\n", score);
+      printf("Strand: %c\n", "+-"[ch[0].rv]);
+      //printf("Query: %d - %d\n", aln.qstart, aln.qend);
+      //printf("Target: %d - %d\n", aln.tstart, aln.tend);
+      printf("Path length: %d\n", kv_size(fullpath));
+      /*
+      if(verbose) {
+        output_human_aln(seq->seq.s, kv_A(refs, ch[0].ref).s, fullpath, stdout);
+      }
+      */
+      float acc = cigar_accuracy(fullpath.a, kv_size(fullpath));
+      printf("Accuracy: %f\n", acc);
+
+      kv_destroy(fullpath);
+      free_chains(ch);
+    }
+
+    else if(strcmp(method, "full_dp") == 0) {
+      fw_path.n = 0; // reset vector to reuse
+      rv_path.n = 0;
+
+      aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &fw_path, verbose);
+      char* rv = rc(seq->seq.s, l, compl);
+      rv_aln = align_full_matrix(rv, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, verbose);
+      free(rv);
+
+      strand = '+';
+      path = fw_path;
+      if(rv_aln.score > aln.score) {
+        aln = rv_aln;
+        path = rv_path;
+        strand = '-';
+      }
+
+      printf("Score: %d\n", aln.score);
+      printf("Strand: %c\n", strand);
+      printf("Query: %d - %d\n", aln.qstart, aln.qend);
+      printf("Target: %d - %d\n", aln.tstart, aln.tend);
+      printf("Path length: %d\n", kv_size(path));
+      float acc = cigar_accuracy(path.a, kv_size(path));
+      printf("Accuracy: %f\n", acc);
+    }
+
+    else {
+      fprintf(stderr, "ERROR: unknown method '%s'\n", method);
+      usage();
+      return 1;
+    }
+  }
+
+  kv_destroy(fw_path);
+  kv_destroy(rv_path);
+  kv_destroy(refs);
+  kv_destroy(refnames); // name strings themselves are reused in refmap and are freed below
+  for(i = kh_begin(refmap); i < kh_end(refmap); i++) {
+    if(kh_exist(refmap, i)) {
+      free((void*)kh_key(refmap, i));
+    }
+  }
+  kh_destroy(faHash, refmap);
+  for(i = kh_begin(h); i < kh_end(h); i++) {
+    if(kh_exist(h, i)) {
+      kv_destroy(kh_value(h, i));
+      free((void*)kh_key(h, i));
+    }
+  }
+  kh_destroy(kmerHash, h);
+
+  kseq_destroy(seq);
+  gzclose(f);
+}
