@@ -35,6 +35,7 @@ typedef struct {
 typedef kvec_t(posPair) pairVec;
 
 // creates uint32(ref id):kvec<qpos,tpos> hash
+// !! the highest bit of ref_id indicates strand
 KHASH_MAP_INIT_INT(matchHash, pairVec);
 
 typedef struct score_pos {
@@ -56,7 +57,7 @@ typedef struct chain {
   uint8_t rv;
 } chain;
 
-chain* do_chain(khash_t(matchHash) *hits, khash_t(matchHash) *rv_hits, int max_chains, int match_score, int max_gap, int min_chain_length);
+chain* do_chain(khash_t(matchHash) *hits, int max_chains, int match_score, int max_gap, int min_chain_length);
 
 void free_chains(chain* chs);
 

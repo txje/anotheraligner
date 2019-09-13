@@ -7,7 +7,7 @@ OBJECTS = aln
 all: $(OBJECTS)
 
 aln: aln.c
-	$(CC) $(CFLAGS) aln.c chain.c -o aln -lz
+	$(CC) $(CFLAGS) aln.c chain.c -o aln -lz -lm
 
 .PHONY: clean
 clean:

@@ -29,6 +29,7 @@
 #include "klib/kvec.h" // C dynamic vector
 #include "klib/khash.h"
 #include <zlib.h>
+#include <math.h>
 #include "chain.h"
 
 #ifndef _kseq_
@@ -103,6 +104,7 @@ int GAP_EXTEND_1 = -2;
 int GAP_OPEN_2 = -24;
 int GAP_EXTEND_2 = -1;
 int LOW = -2000000000; // almost the lowest 32-bit integer
+char compl[256];
 
 float cigar_accuracy(unsigned char *cigar, int cigar_len) {
   int matches = 0, total = 0;
@@ -181,28 +183,54 @@ void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
   free(ts);
 }
 
-void output_paf(FILE* o, char* qn, int ql, int qs, int qe, char strand, char* tn, int tl, int ts, int te, charvec fullpath) {
+void output_paf(FILE* o, char* qn, int ql, int qs, int qe, chain ch, char* tn, int tl, int ts, int te, charvec fullpath, int score, int f1, int f2) {
   // minimap2 flags: NM:i:10828    ms:i:21848  AS:i:21066      nn:i:0 tp:A:P                                     cm:i:535   s1:i:5023   s2:i:0 de:f:0.1848 rl:i:0 cg:Z:100M1D100M...
   //                 edit distance             alignment score        type (P/primary, S/secondary, I/inversion) minimizers chain score                           CIGAR
-  /*
   fprintf(o, "%s\t", qn);
   fprintf(o, "%d\t", ql);
   fprintf(o, "%d\t", qs);
   fprintf(o, "%d\t", qe);
-  fprintf(o, "%c\t", strand);
+  fprintf(o, "%c\t", "+-"[ch.rv]);
   fprintf(o, "%s\t", tn);
   fprintf(o, "%d\t", tl);
   fprintf(o, "%d\t", ts);
   fprintf(o, "%d\t", te);
-  int num_matches = 0;
-  fprintf(o, "%d\t", num_matches);
-  fprintf(o, "%d\t", kv_size(fullpath));
+  int matches = 0, total = 0;
+  int i;
+  for(i = 0; i < kv_size(fullpath); i++) {
+    if(kv_A(fullpath, i) == MATCH) {
+      matches++;
+    }
+    total++;
+  }
+  fprintf(o, "%d\t", matches);
+  fprintf(o, "%d\t", total);
   // to match minimap2: mapQ = 40 * (1-f2/f1) * min(1,m/10) * ln(f1) where m is the number of anchors, f1 is the chaining score, f2 is the second best chain score
   int map_qual = 255;
+  //map_qual = (int)(40.0 * (1-(f2 > 0 ? f2/f1 : 0)) * (1 < kv_size(ch.anchors)/10.0 ? 1 : kv_size(ch.anchors)/10.0) * log(f1));
   fprintf(o, "%d\t", map_qual);
-  char* flag = "NA";
-  fprintf(o, "%s\n", flag);
-  */
+  fprintf(o, "NM:i:%d\t", total-matches);
+  fprintf(o, "AS:i:%d\t", score);
+  fprintf(o, "tp:A:P\t");
+  fprintf(o, "s1:i:%d\t", f1);
+  fprintf(o, "s2:i:%d\t", f2);
+  fprintf(o, "cg:Z:");
+  char op;
+  int ct = 0;
+  for(i = 0; i < kv_size(fullpath); i++) {
+    if(i == 0 || kv_A(fullpath, i) != op) {
+      if(i > 0) {
+        fprintf(o, "%d", ct);
+        fprintf(o, "%c", "MIDM"[op]);
+      }
+      op = kv_A(fullpath, i);
+      ct = 0;
+    }
+    ct++;
+  }
+  fprintf(o, "%d", ct);
+  fprintf(o, "%c", "MIDM"[op]);
+  fprintf(o, "\n");
 }
 
 void print_matrix(dp_cell **m, int q0, int q1, int t0, int t1, char* query, char* target) {
@@ -225,7 +253,10 @@ void print_matrix(dp_cell **m, int q0, int q1, int t0, int t1, char* query, char
 }
 
 // query along y-axis, target along x
-result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec *path, int verbose) {
+result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec *path, int rv, int verbose) {
+  if(verbose) {
+    //fprintf(stderr, "aligning q%c(%d) to t(%d)\n", "+-"[rv], qlen, tlen);
+  }
 
   if(tlen == 0 || qlen == 0) {
     result res;
@@ -260,9 +291,8 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
 
   for(y = 1; y <= qlen; y++) {
     for(x = 1; x <= tlen; x++) {
-
       // match
-      if(query[y-1] == target[x-1]) {
+      if((rv ? compl[query[qlen-y]] : query[y-1]) == target[x-1]) {
         match_score = MATCH_SCORE;
       } else {
         match_score = MISMATCH_SCORE;
@@ -288,7 +318,7 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
       // compare
       if(match_score >= ins_score && match_score >= del_score) {
         dp_matrix[y][x].score = match_score;
-        if(query[y-1] == target[x-1]) {
+        if((rv ? compl[query[qlen-y]] : query[y-1]) == target[x-1]) {
           dp_matrix[y][x].direction = MATCH;
         } else {
           dp_matrix[y][x].direction = MISMATCH;
@@ -363,6 +393,10 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
     free(dp_matrix[i]);
   }
   free(dp_matrix);
+
+  if(verbose) {
+    //fprintf(stderr, "  done aligning q%c(%d) to t(%d) with score %d\n", "+-"[rv], qlen, tlen, res.score);
+  }
 
   return res;
 }
@@ -447,7 +481,6 @@ int main(int argc, char *argv[]) {
   kv_init(rv_path);
 
   // set up complement array
-  char compl[256];
   for(i = 0; i < 256; i++) {
     compl[i] = 'N';
   }
@@ -542,7 +575,6 @@ int main(int argc, char *argv[]) {
 
     if(strcmp(method, "kmer") == 0) {
       khash_t(matchHash) *hits = kh_init(matchHash);
-      khash_t(matchHash) *rv_hits = kh_init(matchHash);
 
       for(j = 0; j < l - k + 1; j++) {
         if(j < l - k) { // except for the very last k-mer, make a fake substring
@@ -570,44 +602,33 @@ int main(int argc, char *argv[]) {
         rv_kmer = rc(seq->seq.s+j, k, compl);
         bin = kh_get(kmerHash, h, rv_kmer);
         if(bin != kh_end(h)) { // hit something
-          pp.qpos = l + k - j; // reverse the k-mer position
+          pp.qpos = l - k - j; // reverse the k-mer position so it represents the start position if the entire query were r/c
           for(i = 0; i < kv_size(kh_val(h, bin)); i++) {
-            bin2 = kh_put(matchHash, rv_hits, kv_A(kh_val(h, bin), i).ref_id, &absent);
+            bin2 = kh_put(matchHash, hits, kv_A(kh_val(h, bin), i).ref_id + (1<<31), &absent);
             if(absent) {
-              kv_init(kh_val(rv_hits, bin2));
+              kv_init(kh_val(hits, bin2));
             }
             pp.tpos = kv_A(kh_val(h, bin), i).pos;
-            kv_push(posPair, kh_val(rv_hits, bin2), pp);
+            kv_push(posPair, kh_val(hits, bin2), pp);
           }
         }
         free(rv_kmer);
       }
-      for(i = kh_begin(hits); i < kh_end(hits); i++) {
-        if(kh_exist(hits, i)) {
-          fprintf(stderr, "ref %u has %u hits\n", kh_key(hits, i), kv_size(kh_val(hits, i)));
-        }
-      }
-      for(i = kh_begin(rv_hits); i < kh_end(rv_hits); i++) {
-        if(kh_exist(rv_hits, i)) {
-          fprintf(stderr, "ref %u (-) has %u hits\n", kh_key(rv_hits, i), kv_size(kh_val(rv_hits, i)));
+      if(verbose) {
+        for(i = kh_begin(hits); i < kh_end(hits); i++) {
+          if(kh_exist(hits, i)) {
+            fprintf(stderr, "ref %u (%c) has %u hits\n", kh_key(hits, i) << 1 >> 1, "+-"[kh_key(hits, i)>>31], kv_size(kh_val(hits, i)));
+          }
         }
       }
 
-      chain *ch = do_chain(hits, rv_hits, 10000, 4, 10000, 3);
+      chain *ch = do_chain(hits, 10000, 4, 10000, 3);
       for(i = kh_begin(hits); i < kh_end(hits); i++) {
         if(kh_exist(hits, i)) {
           kv_destroy(kh_value(hits, i));
         }
       }
       kh_destroy(matchHash, hits);
-      for(i = kh_begin(rv_hits); i < kh_end(rv_hits); i++) {
-        if(kh_exist(rv_hits, i)) {
-          kv_destroy(kh_value(rv_hits, i));
-        }
-      }
-      kh_destroy(matchHash, rv_hits);
-      int f1 = ch[0].score;
-      int f2 = ch[1].score;
 
       // print all anchor sets
       if(verbose) {
@@ -668,7 +689,7 @@ int main(int argc, char *argv[]) {
             if(verbose) {
               //fprintf(stderr, "aligning q %u-%u to t %u-%u\n", q, qe, t, te);
             }
-            aln = align_full_matrix(seq->seq.s+q, kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, verbose);
+            aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
             score += aln.score;
             for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
               kv_push(unsigned char, fullpath, kv_A(fw_path, kv_size(fw_path)-1-i));
@@ -683,19 +704,14 @@ int main(int argc, char *argv[]) {
         }
       }
 
-      //output_paf(seq->name.s, l, qs, qe, "+-"[ch[0].rv], kv_A(refnames, ch[0].ref), kv_A(refs, ch[0].ref).l, ts, te, fullpath);
-      printf("Score: %d\n", score);
-      printf("Strand: %c\n", "+-"[ch[0].rv]);
-      //printf("Query: %d - %d\n", aln.qstart, aln.qend);
-      //printf("Target: %d - %d\n", aln.tstart, aln.tend);
-      printf("Path length: %d\n", kv_size(fullpath));
+      int f1 = ch[0].score;
+      int f2 = ch[1].score;
+      output_paf(stdout, seq->name.s, l, 0, l, ch[0], kv_A(refnames, ch[0].ref), kv_A(refs, ch[0].ref).l, 0, kv_A(refs, ch[0].ref).l, fullpath, score, f1, f2);
       /*
       if(verbose) {
         output_human_aln(seq->seq.s, kv_A(refs, ch[0].ref).s, fullpath, stdout);
       }
       */
-      float acc = cigar_accuracy(fullpath.a, kv_size(fullpath));
-      printf("Accuracy: %f\n", acc);
 
       kv_destroy(fullpath);
       free_chains(ch);
@@ -705,10 +721,12 @@ int main(int argc, char *argv[]) {
       fw_path.n = 0; // reset vector to reuse
       rv_path.n = 0;
 
-      aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &fw_path, verbose);
-      char* rv = rc(seq->seq.s, l, compl);
-      rv_aln = align_full_matrix(rv, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, verbose);
-      free(rv);
+      aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &fw_path, 0, verbose);
+
+      //char* rv = rc(seq->seq.s, l, compl);
+      //rv_aln = align_full_matrix(rv, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, 1, verbose);
+      //free(rv);
+      rv_aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, 1, verbose);
 
       strand = '+';
       path = fw_path;
