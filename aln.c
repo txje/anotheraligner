@@ -389,7 +389,7 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
   // end positions are INCLUSIVE
 
   // free these up in case we'll be doing this repeatedly
-  for(i = 0; i < qlen; i++) {
+  for(i = 0; i <= qlen; i++) {
     free(dp_matrix[i]);
   }
   free(dp_matrix);
@@ -549,6 +549,8 @@ int main(int argc, char *argv[]) {
       bin = kh_put(kmerHash, h, kmer, &absent);
       if(absent) {
         kv_init(kh_val(h, bin));
+      } else {
+        free(kmer);
       }
       rp.pos = j;
       kv_push(ref_pos, kh_val(h, bin), rp);
@@ -715,6 +717,10 @@ int main(int argc, char *argv[]) {
 
       kv_destroy(fullpath);
       free_chains(ch);
+
+      if(n++ >= 10) {
+        break;
+      }
     }
 
     else if(strcmp(method, "full_dp") == 0) {
@@ -754,6 +760,9 @@ int main(int argc, char *argv[]) {
 
   kv_destroy(fw_path);
   kv_destroy(rv_path);
+  for(i = 0; i < kv_size(refs); i++) {
+    free(kv_A(refs, i).s);
+  }
   kv_destroy(refs);
   kv_destroy(refnames); // name strings themselves are reused in refmap and are freed below
   for(i = kh_begin(refmap); i < kh_end(refmap); i++) {

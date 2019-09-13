@@ -174,7 +174,7 @@ chain* do_chain(khash_t(matchHash) *hits, int max_chains, int match_score, int m
 void free_chains(chain* chs) {
   int i;
   for(i = 0; ; i++) {
-    if(kv_size(chs[i].anchors) > 0) {
+    if(kv_size(chs[i].anchors) == 0) {
       break;
     }
     kv_destroy(chs[i].anchors);
