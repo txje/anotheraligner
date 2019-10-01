@@ -66,12 +66,14 @@ void usage() {
   printf("  -r: Reference FASTA/Q[.gz]\n");
   printf("  -v, --verbose: verbose\n");
   printf("  -h, --help: show this\n");
+  printf("  -l, --limit N: stop processing after N query seqs\n");
 }
 
 static struct option long_options[] = {
 // if these are the same as a single-character option, put that character in the 4th field instead of 0
   { "verbose",                no_argument,       0, 'v' },
   { "help",                   no_argument,       0, 'h' },
+  { "limit",                  required_argument, 0, 'l' },
   { 0, 0, 0, 0}
 };
 
@@ -133,7 +135,8 @@ typedef struct {
   uint16_t gap_size; // supports gaps up to 65Kbp
 } dp_cell;
 
-void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
+// returns a status code, 0 if OK, 1 if the alignment didn't make sense
+int output_human_aln(char* qseq, int ql, char* tseq, int rv, charvec path, FILE* o) {
   int q = 0;
   int t = 0;
   uint32_t qst = 0;
@@ -145,17 +148,34 @@ void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
   as[150] = '\0';
   ts[150] = '\0';
   int i;
+  //fprintf(o, "path of length %u\n", kv_size(path));
   for(i = 0; i < kv_size(path); i++) {
     if(kv_A(path, i) == MATCH) {
-      qs[i%150] = qseq[q++];
+      qs[i%150] = rv ? compl[qseq[ql-1-q++]] : qseq[q++];
       as[i%150] = '|';
       ts[i%150] = tseq[t++];
+      if(qs[i%150] != ts[i%150]) {
+        fprintf(stderr, "ERROR: bad alignment at position %d in the path\n", i);
+        qs[i%150+1] = '\0';
+        as[i%150+1] = '\0';
+        ts[i%150+1] = '\0';
+        /*
+        fprintf(o, "%10u %s\n", qst, qs);
+        fprintf(o, "%10s %s\n", " ", as);
+        fprintf(o, "%10u %s\n", tst, ts);
+        fprintf(o, "\n");
+        */
+        free(qs);
+        free(as);
+        free(ts);
+        return 1;
+      }
     } else if(kv_A(path, i) == MISMATCH) {
-      qs[i%150] = qseq[q++];
+      qs[i%150] = rv ? compl[qseq[ql-1-q++]] : qseq[q++];
       as[i%150] = ' ';
       ts[i%150] = tseq[t++];
     } else if(kv_A(path, i) == INS) {
-      qs[i%150] = qseq[q++];
+      qs[i%150] = rv ? compl[qseq[ql-1-q++]] : qseq[q++];
       as[i%150] = ' ';
       ts[i%150] = '-';
     } else if(kv_A(path, i) == DEL) {
@@ -170,10 +190,12 @@ void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
         as[i%150+1] = '\0';
         ts[i%150+1] = '\0';
       }
+      /*
       fprintf(o, "%10u %s\n", qst, qs);
       fprintf(o, "%10s %s\n", " ", as);
       fprintf(o, "%10u %s\n", tst, ts);
       fprintf(o, "\n");
+      */
       qst = q;
       tst = t;
     }
@@ -181,6 +203,7 @@ void output_human_aln(char* qseq, char* tseq, charvec path, FILE* o) {
   free(qs);
   free(as);
   free(ts);
+  return 0;
 }
 
 void output_paf(FILE* o, char* qn, int ql, int qs, int qe, chain ch, char* tn, int tl, int ts, int te, charvec fullpath, int score, int f1, int f2) {
@@ -221,7 +244,7 @@ void output_paf(FILE* o, char* qn, int ql, int qs, int qe, chain ch, char* tn, i
     if(i == 0 || kv_A(fullpath, i) != op) {
       if(i > 0) {
         fprintf(o, "%d", ct);
-        fprintf(o, "%c", "MIDM"[op]);
+        fprintf(o, "%c", "MIDX"[op]);
       }
       op = kv_A(fullpath, i);
       ct = 0;
@@ -229,7 +252,7 @@ void output_paf(FILE* o, char* qn, int ql, int qs, int qe, chain ch, char* tn, i
     ct++;
   }
   fprintf(o, "%d", ct);
-  fprintf(o, "%c", "MIDM"[op]);
+  fprintf(o, "%c", "MIDX"[op]);
   fprintf(o, "\n");
 }
 
@@ -255,7 +278,7 @@ void print_matrix(dp_cell **m, int q0, int q1, int t0, int t1, char* query, char
 // query along y-axis, target along x
 result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec *path, int rv, int verbose) {
   if(verbose) {
-    //fprintf(stderr, "aligning q%c(%d) to t(%d)\n", "+-"[rv], qlen, tlen);
+    fprintf(stderr, "aligning q%c(%d) to t(%d)\n", "+-"[rv], qlen, tlen);
   }
 
   if(tlen == 0 || qlen == 0) {
@@ -265,6 +288,10 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
     return res;
   }
 
+  if((qlen+1)*(tlen+1) > 0) {
+    fprintf(stderr, "aligning q (%d) to t (%d)\n", qlen, tlen);
+    fprintf(stderr, "  allocating matrix with %d cells (%d bytes)\n", ((uint64_t)qlen+1)*(tlen+1), ((uint64_t)qlen+1)*(tlen+1)*7);
+  }
   dp_cell** dp_matrix = malloc((qlen+1) * sizeof(dp_cell*));
   int i;
   for(i = 0; i <= qlen; i++) {
@@ -407,17 +434,21 @@ int main(int argc, char *argv[]) {
   char* ref_fasta = NULL;
   char* method = "kmer";
   int verbose = 0;
+  int limit = 0;
 
   // ---------- options ----------
   int opt, long_idx;
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, "q:r:vh", long_options, &long_idx)) != -1) {
+  while ((opt = getopt_long(argc, argv, "q:r:l:vh", long_options, &long_idx)) != -1) {
     switch (opt) {
       case 'q':
         read_fasta = optarg;
         break;
       case 'r':
         ref_fasta = optarg;
+        break;
+      case 'l':
+        limit = atoi(optarg);
         break;
       case 'v':
         verbose = 1;
@@ -438,6 +469,7 @@ int main(int argc, char *argv[]) {
         // as long as all the long arguments have characters too, I don't think this section will be used
         if (long_idx == 0) verbose = 1; // --verbose
         else if (long_idx == 1) {usage(); return 0;} // --help
+        else if (long_idx == 2) limit = atoi(optarg); // --limit
         break;
       default:
         usage();
@@ -560,7 +592,7 @@ int main(int argc, char *argv[]) {
   // ---------- load reads ----------
   f = gzopen(read_fasta, "r");
   seq = kseq_init(f);
-  printf("Reading fasta file: %s\n", read_fasta);
+  fprintf(stderr, "Reading fasta file: %s\n", read_fasta);
 
   char* rv_kmer;
   result aln, rv_aln;
@@ -571,6 +603,11 @@ int main(int argc, char *argv[]) {
   posPair pp;
   while ((l = kseq_read(seq)) >= 0) {
     // name: seq->name.s, seq: seq->seq.s, length: l
+    if(l < k) {
+      if(verbose)
+        fprintf(stderr, "%s is too short (%d bp)\n", seq->name.s, l);
+      continue;
+    }
     if(verbose) {
       fprintf(stderr, "Aligning %s (%i bp).\n", seq->name.s, l);
     }
@@ -648,7 +685,9 @@ int main(int argc, char *argv[]) {
       }
 
       if(kv_size(ch[0].anchors) == 0) {
-        fprintf(stderr, "No chain (no k-mer hits) for read '%s'\n", seq->name.s);
+        if(verbose)
+          fprintf(stderr, "No chain (no k-mer hits) for read '%s'\n", seq->name.s);
+        free_chains(ch);
         continue;
       }
 
@@ -661,25 +700,39 @@ int main(int argc, char *argv[]) {
       for(j = 0; j <= kv_size(ch[0].anchors); j++) {
         qe = j < kv_size(ch[0].anchors) ? kv_A(ch[0].anchors, j).qpos : l;
         te = j < kv_size(ch[0].anchors) ? kv_A(ch[0].anchors, j).tpos : kv_A(refs, ch[0].ref).l;
-        if(qe <= q && te <= t) {
-          // both overlap, they MUST be identical, and they are probably (unless we exclude some [repetitive] k-mers) 1bp apart
-          // add a match for every base they *don't* overlap, up to the end of the read
-          //fprintf(stderr, "inter-kmer match of length %u\n", ((l < qe + k ? l : qe + k)-q));
-          for(i = q; i < (l < qe + k ? l : qe + k); i++)
+        if(q > 0 && qe <= q && te <= t) {
+          // both overlap, but they are NOT necessarily identical, but they must overlap a homopolymer stretch
+          // add a match for every base they *don't* overlap AND are the same length, up to the end of the read
+          uint32_t min_len = qe + k - q < te + k - t ? qe + k - q : te + k - t;
+          uint32_t max_len = qe + k - q > te + k - t ? qe + k - q : te + k - t;
+          if(verbose && (qe+k-q > 1 || te+k-t > 1)) {
+            fprintf(stderr, "inter-kmer match of length  of %u (q) and %u (t)\n", qe + k - q, te + k - t);
+          }
+          for(i = 0; i < min_len; i++)
             kv_push(unsigned char, fullpath, MATCH);
+          for(i = 0; i < max_len - min_len; i++) {
+            if(qe + k - q > te + k - t)
+              kv_push(unsigned char, fullpath, INS);
+            if(qe + k - q < te + k - t)
+              kv_push(unsigned char, fullpath, DEL);
+          }
         } else {
           if(qe <= q && te > t) {
             if(j > 0)
               for(i = 0; i < (k+qe-q); i++)
                 kv_push(unsigned char, fullpath, MATCH);
-            //fprintf(stderr, "DEL of length %u\n", ((te-t) - (qe-q)));
+            if(verbose) {
+              fprintf(stderr, "DEL of length %u\n", ((te-t) - (qe-q)));
+            }
             for(i = 0; i < (te-t) - (qe-q); i++)
               kv_push(unsigned char, fullpath, DEL);
           } else if(te <= t && qe > q) {
             if(j > 0)
               for(i = 0; i < (k+te-t); i++)
                 kv_push(unsigned char, fullpath, MATCH);
-            //fprintf(stderr, "INS of length %u\n", ((qe-q) - (te-t)));
+            if(verbose) {
+              fprintf(stderr, "INS of length %u\n", ((qe-q) - (te-t)));
+            }
             for(i = 0; i < (qe-q) - (te-t); i++)
               kv_push(unsigned char, fullpath, INS);
           } else {
@@ -689,14 +742,17 @@ int main(int argc, char *argv[]) {
             fw_path.n = 0; // reset vector to reuse
             rv_path.n = 0;
             if(verbose) {
-              //fprintf(stderr, "aligning q %u-%u to t %u-%u\n", q, qe, t, te);
+              fprintf(stderr, "aligning q %u-%u to t %u-%u\n", q, qe, t, te);
             }
             aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
             score += aln.score;
             for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
               kv_push(unsigned char, fullpath, kv_A(fw_path, kv_size(fw_path)-1-i));
+              if(verbose)
+                fprintf(stderr, "%u", kv_A(fw_path, kv_size(fw_path)-1-i));
             }
-            //fprintf(stderr, "\n");
+            if(verbose)
+              fprintf(stderr, "\n");
           }
         }
         if(j < kv_size(ch[0].anchors)) {
@@ -709,16 +765,15 @@ int main(int argc, char *argv[]) {
       int f1 = ch[0].score;
       int f2 = ch[1].score;
       output_paf(stdout, seq->name.s, l, 0, l, ch[0], kv_A(refnames, ch[0].ref), kv_A(refs, ch[0].ref).l, 0, kv_A(refs, ch[0].ref).l, fullpath, score, f1, f2);
-      /*
-      if(verbose) {
-        output_human_aln(seq->seq.s, kv_A(refs, ch[0].ref).s, fullpath, stdout);
-      }
-      */
+      int res = output_human_aln(seq->seq.s, l, kv_A(refs, ch[0].ref).s, ch[0].rv, fullpath, stdout);
 
       kv_destroy(fullpath);
       free_chains(ch);
 
-      if(n++ >= 10) {
+      if(res != 0) {
+        break;
+      }
+      if(limit > 0 && ++n >= limit) {
         break;
       }
     }

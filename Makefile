@@ -1,6 +1,8 @@
 CC=gcc
 CFLAGS=-O2
 #-std=c99 
+# for valgrind/line debugging:
+#-g
 
 OBJECTS = aln
 
