@@ -42,6 +42,8 @@ KSEQ_INIT(gzFile, gzread)
 
 #endif
 
+#define score_gap(a) (a == 0 ? 0 : ((GAP_OPEN_1 + (a-1) * GAP_EXTEND_1 > GAP_OPEN_2 + (a-1) * GAP_EXTEND_2) ? GAP_OPEN_1 + (a-1) * GAP_EXTEND_1 : GAP_OPEN_2 + (a-1) * GAP_EXTEND_2))
+
 typedef struct {
   char* s;
   uint32_t l;
@@ -135,6 +137,12 @@ typedef struct {
   uint16_t gap_size; // supports gaps up to 65Kbp
 } dp_cell;
 
+// absolute x,y offset of each band
+typedef struct {
+  uint32_t x;
+  uint32_t y;
+} os;
+
 // returns a status code, 0 if OK, 1 if the alignment didn't make sense
 int output_human_aln(char* qseq, int ql, char* tseq, int rv, charvec path, FILE* o) {
   int q = 0;
@@ -159,12 +167,12 @@ int output_human_aln(char* qseq, int ql, char* tseq, int rv, charvec path, FILE*
         qs[i%150+1] = '\0';
         as[i%150+1] = '\0';
         ts[i%150+1] = '\0';
-        /*
-        fprintf(o, "%10u %s\n", qst, qs);
-        fprintf(o, "%10s %s\n", " ", as);
-        fprintf(o, "%10u %s\n", tst, ts);
-        fprintf(o, "\n");
-        */
+        if(o) {
+          fprintf(o, "%10u %s\n", qst, qs);
+          fprintf(o, "%10s %s\n", " ", as);
+          fprintf(o, "%10u %s\n", tst, ts);
+          fprintf(o, "\n");
+        }
         free(qs);
         free(as);
         free(ts);
@@ -190,12 +198,12 @@ int output_human_aln(char* qseq, int ql, char* tseq, int rv, charvec path, FILE*
         as[i%150+1] = '\0';
         ts[i%150+1] = '\0';
       }
-      /*
-      fprintf(o, "%10u %s\n", qst, qs);
-      fprintf(o, "%10s %s\n", " ", as);
-      fprintf(o, "%10u %s\n", tst, ts);
-      fprintf(o, "\n");
-      */
+      if(o) {
+        fprintf(o, "%10u %s\n", qst, qs);
+        fprintf(o, "%10s %s\n", " ", as);
+        fprintf(o, "%10u %s\n", tst, ts);
+        fprintf(o, "\n");
+      }
       qst = q;
       tst = t;
     }
@@ -275,6 +283,220 @@ void print_matrix(dp_cell **m, int q0, int q1, int t0, int t1, char* query, char
   }
 }
 
+void print_bands(dp_cell **b, os* offset, int band_width, int q0, int q1, int t0, int t1, char* query, char* target) {
+  int x, y;
+  fprintf(stderr, "       ");
+  for(x = t0; x < t1; x++) {
+    fprintf(stderr, " %4d", x);
+  }
+  fprintf(stderr, "\n");
+  fprintf(stderr, "       ");
+  for(x = t0; x < t1; x++) {
+    fprintf(stderr, "    %c", target[x]);
+  }
+  fprintf(stderr, "\n");
+  for(y = q0; y < q1; y++) {
+    fprintf(stderr, "%4d %c |", y, query[y]);
+    for(x = t0; x < t1; x++) {
+      dp_cell* c = x-offset[x+y].x >= 0 && x-offset[x+y].x < band_width ? &b[x+y][x-offset[x+y].x] : NULL;
+      if(c)
+        fprintf(stderr, c->score < 0 ? " %c%3d" : "  %c%2d", "MIDX"[c->direction], c->score % 100);
+      else
+        fprintf(stderr, "     ");
+    }
+    fprintf(stderr, "\n");
+  }
+}
+
+// dynamic banded alignment, maybe w/SSE in the future
+// query along y-axis, target along x
+result align_banded(char* query, char* target, int qlen, int tlen, charvec *path, int rv, int verbose, int band_width) {
+  if(verbose) {
+    fprintf(stderr, "aligning q%c(%d) to t(%d)\n", "+-"[rv], qlen, tlen);
+  }
+
+  if(tlen == 0 || qlen == 0) {
+    result res;
+    res.failed = 1;
+    // other fields are unset and unreliable
+    return res;
+  }
+
+  dp_cell** bands = malloc((qlen+tlen-1) * sizeof(dp_cell*));
+  int i, j;
+  for(i = 0; i < qlen+tlen-1; i++) {
+    bands[i] = malloc(band_width * sizeof(dp_cell));
+  }
+
+  os* offset = malloc((qlen+tlen-1) * sizeof(os));
+  offset[0].x = 0;
+  offset[0].y = 0;
+
+  int x, y; // position of the LEFT END of the band
+  int max_in_band;
+  int match_score, ins_score, del_score;
+
+  bands[0][0].score = 0;
+
+  for(i = 0; i < qlen+tlen-1; i++) {
+    x = offset[i].x;
+    y = offset[i].y;
+    //fprintf(stderr, "band starts at %d, %d\n", x, y);
+    max_in_band = 0;
+
+    for(j = 0; j < band_width; j++) {
+      // find the appropriate cell for each 3 possible sources, if they exist
+      dp_cell* prev = (i >= 2 && j + (offset[i].x - offset[i-2].x)/2 - (offset[i].y - offset[i-2].y)/2 < band_width && j + (offset[i].x - offset[i-2].x)/2 - (offset[i].y - offset[i-2].y)/2 >= 0 && y > 0 && x > 0 ? &bands[i-2][j + (offset[i].x - offset[i-2].x)/2 - (offset[i].y - offset[i-2].y)/2] : NULL);
+      dp_cell* up = (i >= 1 && j + (offset[i].x - offset[i-1].x) < band_width && j + (offset[i].x - offset[i-1].x) >= 0 && y > 0 ? &bands[i-1][j + (offset[i].x - offset[i-1].x)] : NULL);
+      dp_cell* left = (i >= 1 && j - (offset[i].y - offset[i-1].y) < band_width && j - (offset[i].y - offset[i-1].y) >= 0 && x > 0 ? &bands[i-1][j - (offset[i].y - offset[i-1].y)] : NULL);
+
+      // do x,y
+      // match
+      if((rv ? compl[query[qlen-y-1]] : query[y]) == target[x]) {
+        match_score = MATCH_SCORE;
+      } else {
+        match_score = MISMATCH_SCORE;
+      }
+      // construct the full ins and del gaps that would be needed to get to this spot if there is no prev
+      match_score = (prev ? prev->score : score_gap(x) + score_gap(y)) + match_score; // gap score should be appropriate even for 0,0 and other edge cells
+
+      // ins
+      if(up && up->direction == INS) {
+        ins_score = up->score - score_gap(up->gap_size) + score_gap(up->gap_size+1);
+      } else {
+        ins_score = up ? up->score + score_gap(1) : score_gap(x) + score_gap(y+1);
+      }
+
+      // del
+      if(left && left->direction == DEL) {
+        del_score = left->score - score_gap(left->gap_size) + score_gap(left->gap_size+1);
+      } else {
+        del_score = left ? left->score + score_gap(1) : score_gap(x+1) + score_gap(y);
+      }
+
+      // compare
+      if(match_score >= ins_score && match_score >= del_score) {
+        bands[i][j].score = match_score;
+        if((rv ? compl[query[qlen-y-1]] : query[y]) == target[x]) {
+          bands[i][j].direction = MATCH;
+        } else {
+          bands[i][j].direction = MISMATCH;
+        }
+        bands[i][j].gap_size = 0;
+      } else if(ins_score >= del_score) {
+        bands[i][j].score = ins_score;
+        bands[i][j].direction = INS;
+        bands[i][j].gap_size = up && up->direction == INS ? up->gap_size + 1 : 1;
+      } else {
+        bands[i][j].score = del_score;
+        bands[i][j].direction = DEL;
+        bands[i][j].gap_size = left && left->direction == DEL ? left->gap_size + 1 : 1;
+      }
+
+      // keep track of the best scoring position
+      if(j > 0 && bands[i][j].score > bands[i][max_in_band].score) {
+        max_in_band = j;
+      }
+
+      if(++x >= tlen)
+        break;
+      if(--y < 0)
+        break;
+    }
+
+    //fprintf(stderr, "maximum score pos is %d, (x: %d, y: %d)\n", max_in_band, offset[i].x + max_in_band, offset[i].y - max_in_band);
+    // recompute offsets, shifting 1 either right or down - right now we can't shift by more than 1 every round
+    if(i < qlen+tlen-2) {
+      if((max_in_band > band_width/2 && offset[i].y >= band_width) || offset[i].y == qlen-1) { // don't move horizontally until the full band is in bounds or we hit the bottom of the query
+        offset[i+1].x = offset[i].x + 1;
+        offset[i+1].y = offset[i].y;
+      } else {
+        offset[i+1].x = offset[i].x;
+        offset[i+1].y = offset[i].y + 1;
+      }
+    }
+  }
+
+  if(verbose) {
+    print_bands(bands, offset, band_width, 0, (30 < qlen ? 30 : qlen), 0, (30 < tlen ? 30 : tlen), query, target);
+    if(qlen > 30)
+      print_bands(bands, offset, band_width, 30, (60 < qlen ? 60 : qlen), 0, (30 < tlen ? 30 : tlen), query, target);
+    if(tlen > 30)
+      print_bands(bands, offset, band_width, 0, (30 < qlen ? 30 : qlen), 30, (60 < tlen ? 60 : tlen), query, target);
+    if(qlen > 30 && tlen > 30)
+      print_bands(bands, offset, band_width, 30, (60 < qlen ? 60 : qlen), 30, (60 < tlen ? 60 : tlen), query, target);
+  }
+
+  // backtrack - we must have ended at bands[qlen+tlen-1][0]
+  i = qlen+tlen-2; // band index
+  j = 0; // index into band of best pos
+  x = offset[i].x;
+  y = offset[i].y;
+  while(i >= 0) {
+    /*
+    fprintf(stderr, "i = %d, j = %d, direction = %u, x = %d, y = %d, offset=%d,%d\n", i, j, bands[i][j].direction, x, y, offset[i].x, offset[i].y);
+    char tmp = query[qlen];
+    query[qlen] = '\0';
+    fprintf(stderr, "query:  %s\n", query);
+    query[qlen] = tmp;
+    tmp = target[tlen];
+    target[tlen] = '\0';
+    fprintf(stderr, "target: %s\n", target);
+    target[tlen] = tmp;
+    fprintf(stderr, "q: %c, t: %c\n", (rv ? compl[query[qlen-y]] : query[y]), target[x]);
+    */
+    kv_push(unsigned char, *path, bands[i][j].direction);
+    if(bands[i][j].direction == MATCH || bands[i][j].direction == MISMATCH) {
+      // check that this is true...
+      if(bands[i][j].direction == MATCH && (rv ? compl[query[qlen-y-1]] : query[y]) != target[x]) {
+        fprintf(stderr, "these do NOT match!\n");
+      }
+      x--;
+      y--;
+      if(i >= 2)
+        j = j + (offset[i].x - offset[i-2].x)/2 - (offset[i].y - offset[i-2].y)/2;
+      i -= 2;
+    } else if(bands[i][j].direction == INS) {
+      y--;
+      if(i >= 1)
+        j = j + (offset[i].x - offset[i-1].x);
+      i--;
+    } else if(bands[i][j].direction == DEL) {
+      x--;
+      if(i >= 1)
+        j = j - (offset[i].y - offset[i-1].y);
+      i--;
+    }
+    if(j < 0 || j >= band_width || x < 0 || y < 0) { // fell off the side, everything else must be INDEL, then quit
+      for(i = 0; i <= x; i++)
+        kv_push(unsigned char, *path, DEL);
+      for(i = 0; i <= y; i++)
+        kv_push(unsigned char, *path, INS);
+      break;
+    }
+  }
+
+  result res;
+  res.score = bands[qlen+tlen-2][0].score;
+  res.qstart = 0;
+  res.qend = offset[qlen+tlen-2].y;
+  res.tstart = 0;
+  res.tend = offset[qlen+tlen-2].x;
+  // end positions are INCLUSIVE
+
+  for(i = 0; i < qlen+tlen-1; i++) {
+    free(bands[i]);
+  }
+  free(bands);
+  free(offset);
+
+  if(verbose) {
+    fprintf(stderr, "  done aligning q%c(%d) to t(%d) with score %d\n", "+-"[rv], qlen, tlen, res.score);
+  }
+
+  return res;
+} // align_banded
+
 // query along y-axis, target along x
 result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec *path, int rv, int verbose) {
   if(verbose) {
@@ -288,8 +510,7 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
     return res;
   }
 
-  if((qlen+1)*(tlen+1) > 0) {
-    fprintf(stderr, "aligning q (%d) to t (%d)\n", qlen, tlen);
+  if(verbose) {
     fprintf(stderr, "  allocating matrix with %d cells (%d bytes)\n", ((uint64_t)qlen+1)*(tlen+1), ((uint64_t)qlen+1)*(tlen+1)*7);
   }
   dp_cell** dp_matrix = malloc((qlen+1) * sizeof(dp_cell*));
@@ -306,12 +527,12 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
 
   // MUST MATCH ENTIRETY OF BOTH query AND ref
   for(y = 1; y <= qlen; y++) {
-    dp_matrix[y][0].score = (GAP_OPEN_2 + GAP_EXTEND_2 * (y-1)) > (GAP_OPEN_1 + GAP_EXTEND_1 * (y-1)) ? (GAP_OPEN_2 + GAP_EXTEND_2 * (y-1)) : (GAP_OPEN_1 + GAP_EXTEND_1 * (y-1));
+    dp_matrix[y][0].score = score_gap(y);
     dp_matrix[y][0].direction = INS;
     dp_matrix[y][0].gap_size = y;
   }
   for(x = 1; x <= tlen; x++) {
-    dp_matrix[0][x].score = (GAP_OPEN_2 + GAP_EXTEND_2 * (x-1)) > (GAP_OPEN_1 + GAP_EXTEND_1 * (x-1)) ? (GAP_OPEN_2 + GAP_EXTEND_2 * (x-1)) : (GAP_OPEN_1 + GAP_EXTEND_1 * (x-1));
+    dp_matrix[0][x].score = score_gap(x);
     dp_matrix[0][x].direction = DEL;
     dp_matrix[0][x].gap_size = x;
   }
@@ -329,17 +550,17 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
       // ins
       if(dp_matrix[y-1][x].direction == INS) {
         // check whether gap scores 1 or 2 are better for this size gap
-        ins_score = dp_matrix[y-dp_matrix[y-1][x].gap_size-1][x].score + ((GAP_OPEN_1 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_1 > GAP_OPEN_2 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_2) ? GAP_OPEN_1 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_1 : GAP_OPEN_2 + dp_matrix[y-1][x].gap_size * GAP_EXTEND_2);
+        ins_score = dp_matrix[y-dp_matrix[y-1][x].gap_size][x].score + score_gap(dp_matrix[y-1][x].gap_size+1);
       } else {
-        ins_score = dp_matrix[y-1][x].score + GAP_OPEN_1;
+        ins_score = dp_matrix[y-1][x].score + score_gap(1);
       }
 
       // del
       if(dp_matrix[y][x-1].direction == DEL) {
         // check whether gap scores 1 or 2 are better for this size gap
-        del_score = dp_matrix[y][x-dp_matrix[y][x-1].gap_size-1].score + ((GAP_OPEN_1 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_1 > GAP_OPEN_2 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_2) ? GAP_OPEN_1 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_1 : GAP_OPEN_2 + dp_matrix[y][x-1].gap_size * GAP_EXTEND_2);
+        del_score = dp_matrix[y][x-dp_matrix[y][x-1].gap_size].score + score_gap(dp_matrix[y][x-1].gap_size+1);
       } else {
-        del_score = dp_matrix[y][x-1].score + GAP_OPEN_1;
+        del_score = dp_matrix[y][x-1].score + score_gap(1);
       }
 
       // compare
@@ -743,8 +964,18 @@ int main(int argc, char *argv[]) {
             rv_path.n = 0;
             if(verbose) {
               fprintf(stderr, "aligning q %u-%u to t %u-%u\n", q, qe, t, te);
+              char tmp = *(seq->seq.s + (ch[0].rv ? l-q : qe));
+              *(seq->seq.s + (ch[0].rv ? l-q : qe)) = '\0';
+              fprintf(stderr, "q: %s\n", seq->seq.s + (ch[0].rv ? l-qe : q));
+              *(seq->seq.s + (ch[0].rv ? l-q : qe)) = tmp;
+              tmp = *(kv_A(refs, ch[0].ref).s+te);
+              *(kv_A(refs, ch[0].ref).s+te) = '\0';
+              fprintf(stderr, "t: %s\n", kv_A(refs, ch[0].ref).s+t);
+              *(kv_A(refs, ch[0].ref).s+te) = tmp;
             }
-            aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
+            //aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
+            int band_width = 10;
+            aln = align_banded(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose, band_width);
             score += aln.score;
             for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
               kv_push(unsigned char, fullpath, kv_A(fw_path, kv_size(fw_path)-1-i));
@@ -765,7 +996,7 @@ int main(int argc, char *argv[]) {
       int f1 = ch[0].score;
       int f2 = ch[1].score;
       output_paf(stdout, seq->name.s, l, 0, l, ch[0], kv_A(refnames, ch[0].ref), kv_A(refs, ch[0].ref).l, 0, kv_A(refs, ch[0].ref).l, fullpath, score, f1, f2);
-      int res = output_human_aln(seq->seq.s, l, kv_A(refs, ch[0].ref).s, ch[0].rv, fullpath, stdout);
+      int res = output_human_aln(seq->seq.s, l, kv_A(refs, ch[0].ref).s, ch[0].rv, fullpath, (verbose ? stdout : NULL));
 
       kv_destroy(fullpath);
       free_chains(ch);
