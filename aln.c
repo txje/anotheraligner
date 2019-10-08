@@ -69,6 +69,8 @@ void usage() {
   printf("  -v, --verbose: verbose\n");
   printf("  -h, --help: show this\n");
   printf("  -l, --limit N: stop processing after N query seqs\n");
+  printf("Advanced options:\n");
+  printf("  -b, --bandwidth: DP band width\n");
 }
 
 static struct option long_options[] = {
@@ -76,6 +78,7 @@ static struct option long_options[] = {
   { "verbose",                no_argument,       0, 'v' },
   { "help",                   no_argument,       0, 'h' },
   { "limit",                  required_argument, 0, 'l' },
+  { "bandwidth",              required_argument, 0, 'b' },
   { 0, 0, 0, 0}
 };
 
@@ -656,11 +659,12 @@ int main(int argc, char *argv[]) {
   char* method = "kmer";
   int verbose = 0;
   int limit = 0;
+  int band_width = 500;
 
   // ---------- options ----------
   int opt, long_idx;
   opterr = 0;
-  while ((opt = getopt_long(argc, argv, "q:r:l:vh", long_options, &long_idx)) != -1) {
+  while ((opt = getopt_long(argc, argv, "q:r:l:b:vh", long_options, &long_idx)) != -1) {
     switch (opt) {
       case 'q':
         read_fasta = optarg;
@@ -670,6 +674,9 @@ int main(int argc, char *argv[]) {
         break;
       case 'l':
         limit = atoi(optarg);
+        break;
+      case 'b':
+        band_width = atoi(optarg);
         break;
       case 'v':
         verbose = 1;
@@ -691,6 +698,7 @@ int main(int argc, char *argv[]) {
         if (long_idx == 0) verbose = 1; // --verbose
         else if (long_idx == 1) {usage(); return 0;} // --help
         else if (long_idx == 2) limit = atoi(optarg); // --limit
+        else if (long_idx == 3) band_width = atoi(optarg); // --bandwidth
         break;
       default:
         usage();
@@ -974,7 +982,6 @@ int main(int argc, char *argv[]) {
               *(kv_A(refs, ch[0].ref).s+te) = tmp;
             }
             //aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
-            int band_width = 10;
             aln = align_banded(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose, band_width);
             score += aln.score;
             for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
