@@ -32,6 +32,8 @@
 #include <math.h>
 #include "chain.h"
 
+#include "ksw2.h"
+
 #ifndef _kseq_
 #define _kseq_
 
@@ -59,10 +61,15 @@ void version() {
 void usage() {
   printf("Usage: aln [options]\n");
   printf("Commands:\n");
-  printf("  global: end-to-end query and ref - useful for full-length amplicons, etc.\n");
-  printf("  read-local: end-to-end ref, but query may be partial\n");
-  printf("  ref-local: end-to-end reads, but ref may be partial - this is most useful for read -> reference mapping\n");
-  printf("  local: both may be partial - often reasonable for long-read -> reference mapping\n");
+  printf("  (global) end-to-end query and ref - useful for full-length amplicons, etc.\n");
+  printf("    gm: full matrix (VERY slow)\n");
+  printf("    gf: seeding, chaining, full matrix to fill gaps (slow)\n");
+  printf("    gb: seeding, chaining, 'adaptive' band (faster)\n");
+  printf("    gk: seeding, chaining, KSW2 [band w/SSE] (fastest)\n");
+  printf("  (not implemented)\n");
+  printf("    read-local: end-to-end ref, but query may be partial\n");
+  printf("    ref-local: end-to-end reads, but ref may be partial - this is most useful for read -> reference mapping\n");
+  printf("    local: both may be partial - often reasonable for long-read -> reference mapping\n");
   printf("Options:\n");
   printf("  -q: FASTA/Q[.gz] file with reads\n");
   printf("  -r: Reference FASTA/Q[.gz]\n");
@@ -165,7 +172,7 @@ int output_human_aln(char* qseq, int ql, char* tseq, int rv, charvec path, FILE*
       qs[i%150] = rv ? compl[qseq[ql-1-q++]] : qseq[q++];
       as[i%150] = '|';
       ts[i%150] = tseq[t++];
-      if(qs[i%150] != ts[i%150]) {
+      if(0 && qs[i%150] != ts[i%150]) {
         fprintf(stderr, "ERROR: bad alignment at position %d in the path\n", i);
         qs[i%150+1] = '\0';
         as[i%150+1] = '\0';
@@ -309,6 +316,48 @@ void print_bands(dp_cell **b, os* offset, int band_width, int q0, int q1, int t0
     }
     fprintf(stderr, "\n");
   }
+}
+
+// see http://github.com/lh3/ksw2
+result ksw2_align(char *qseq, char *tseq, int ql, int tl, charvec *path, int rv, int verbose, int band_width) {
+  int i, j, a = MATCH_SCORE, b = MISMATCH_SCORE;
+  int8_t mat[25] = { a,b,b,b,0, b,a,b,b,0, b,b,a,b,0, b,b,b,a,0, 0,0,0,0,0 };
+  uint8_t *ts, *qs, c[256];
+  ksw_extz_t ez;
+
+  memset(&ez, 0, sizeof(ksw_extz_t));
+  memset(c, 4, 256);
+  c['A'] = c['a'] = 0; c['C'] = c['c'] = 1;
+  c['G'] = c['g'] = 2; c['T'] = c['t'] = 3; // build the encoding table
+  ts = (uint8_t*)malloc(tl);
+  qs = (uint8_t*)malloc(ql);
+  for (i = 0; i < tl; ++i) ts[i] = c[(uint8_t)tseq[i]]; // encode to 0/1/2/3
+  for (i = 0; i < ql; ++i) qs[i] = c[(uint8_t)(rv ? compl[qseq[ql-i-1]] : qseq[i])];
+  
+  //void ksw_extd2_sse41(void *km, int qlen, const uint8_t *query, int tlen, const uint8_t *target, int8_t m, const int8_t *mat,
+  //                     int8_t q, int8_t e, int8_t q2, int8_t e2, int w, int zdrop, int end_bonus, int flag, ksw_extz_t *ez)
+  int zdrop = -1; // @param zdrop     off-diagonal drop-off to stop extension (positive; <0 to disable)
+  int end_bonus = 0; // ? it is certainly only checked if EXTZ_ONLY flag is set...
+  int flag = rv ? 128 : 0; // 128: reverse cigar
+  // for some reason it expects positive gap penalties
+  ksw_extd2_sse41(ql, qs, tl, ts, 5, mat, -1*GAP_OPEN_1, -1*GAP_EXTEND_1, -1*GAP_OPEN_2, -1*GAP_EXTEND_2, band_width, zdrop, end_bonus, flag, &ez);
+
+  //fprintf(stderr, "aln q %d - t %d producing cigar of length %d\n", ql, tl, ez.n_cigar);
+  for (i = ez.n_cigar-1; i >= 0; --i) // print CIGAR -- REVERSE, just because that's what our other 2 aligners produced by default
+    for(j = 0; j < ez.cigar[i]>>4; j++)
+      kv_push(char, *path, ez.cigar[i]&0xf);
+    //printf("%d%c", ez.cigar[i]>>4, "MID"[ez.cigar[i]&0xf]);
+  //putchar('\n');
+  free(ez.cigar); free(ts); free(qs);
+
+  result r;
+  r.score = ez.score;
+  r.qstart = 0;
+  r.qend = ql;
+  r.tstart = 0;
+  r.tend = tl;
+  r.failed = 0;
+  return r;
 }
 
 // dynamic banded alignment, maybe w/SSE in the future
@@ -656,7 +705,6 @@ result align_full_matrix(char* query, char* target, int qlen, int tlen, charvec 
 int main(int argc, char *argv[]) {
   char* read_fasta = NULL;
   char* ref_fasta = NULL;
-  char* method = "kmer";
   int verbose = 0;
   int limit = 0;
   int band_width = 500;
@@ -714,6 +762,11 @@ int main(int argc, char *argv[]) {
     }
   }
   if(command == NULL) {
+    usage();
+    return 1;
+  }
+  if(strcmp(command, "gm") != 0 && strcmp(command, "gf") != 0 && strcmp(command, "gb") != 0 && strcmp(command, "gk") != 0) {
+    fprintf(stderr, "ERROR: unrecognized command '%s'\n", command);
     usage();
     return 1;
   }
@@ -797,24 +850,27 @@ int main(int argc, char *argv[]) {
   gzclose(f);
 
   // ---------- build k-mer hash (kmer : ref/pos) ------------
-  khash_t(kmerHash) *h = kh_init(kmerHash);
-  char *kmer;
-  ref_pos rp;
-  for(i = 0; i < kv_size(refs); i++) {
-    rp.ref_id = i;
-    for(j = 0; j < kv_A(refs, i).l - k + 1; j++) {
-      kmer = malloc((k+1) * sizeof(char));
-      kmer[k] = '\0';
-      memcpy(kmer, kv_A(refs, i).s+j, k);
-      //fprintf(stderr, "%s at %u:%u\n", kmer, i, j);
-      bin = kh_put(kmerHash, h, kmer, &absent);
-      if(absent) {
-        kv_init(kh_val(h, bin));
-      } else {
-        free(kmer);
+  khash_t(kmerHash) *h;
+  if(strcmp(command, "gm") != 0) {
+    h = kh_init(kmerHash);
+    char *kmer;
+    ref_pos rp;
+    for(i = 0; i < kv_size(refs); i++) {
+      rp.ref_id = i;
+      for(j = 0; j < kv_A(refs, i).l - k + 1; j++) {
+        kmer = malloc((k+1) * sizeof(char));
+        kmer[k] = '\0';
+        memcpy(kmer, kv_A(refs, i).s+j, k);
+        //fprintf(stderr, "%s at %u:%u\n", kmer, i, j);
+        bin = kh_put(kmerHash, h, kmer, &absent);
+        if(absent) {
+          kv_init(kh_val(h, bin));
+        } else {
+          free(kmer);
+        }
+        rp.pos = j;
+        kv_push(ref_pos, kh_val(h, bin), rp);
       }
-      rp.pos = j;
-      kv_push(ref_pos, kh_val(h, bin), rp);
     }
   }
 
@@ -841,7 +897,7 @@ int main(int argc, char *argv[]) {
       fprintf(stderr, "Aligning %s (%i bp).\n", seq->name.s, l);
     }
 
-    if(strcmp(method, "kmer") == 0) {
+    if(strcmp(command, "gf") == 0 || strcmp(command, "gb") == 0 || strcmp(command, "gk") == 0) {
       khash_t(matchHash) *hits = kh_init(matchHash);
 
       for(j = 0; j < l - k + 1; j++) {
@@ -981,8 +1037,14 @@ int main(int argc, char *argv[]) {
               fprintf(stderr, "t: %s\n", kv_A(refs, ch[0].ref).s+t);
               *(kv_A(refs, ch[0].ref).s+te) = tmp;
             }
-            //aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
-            aln = align_banded(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose, band_width);
+
+            if(strcmp(command, "gf") == 0)
+              aln = align_full_matrix(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose);
+            if(strcmp(command, "gb") == 0)
+              aln = align_banded(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose, band_width);
+            if(strcmp(command, "gk") == 0)
+              aln = ksw2_align(seq->seq.s + (ch[0].rv ? l-qe : q), kv_A(refs, ch[0].ref).s+t, qe - q, te - t, &fw_path, ch[0].rv, verbose, band_width);
+
             score += aln.score;
             for(i = 0; i < kv_size(fw_path); i++) { // path is reversed from alignment - we have to do it this way instead of i-- because i is unsigned!!
               kv_push(unsigned char, fullpath, kv_A(fw_path, kv_size(fw_path)-1-i));
@@ -1016,15 +1078,11 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    else if(strcmp(method, "full_dp") == 0) {
+    else if(strcmp(command, "gm") == 0) {
       fw_path.n = 0; // reset vector to reuse
       rv_path.n = 0;
 
       aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &fw_path, 0, verbose);
-
-      //char* rv = rc(seq->seq.s, l, compl);
-      //rv_aln = align_full_matrix(rv, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, 1, verbose);
-      //free(rv);
       rv_aln = align_full_matrix(seq->seq.s, kv_A(refs, 0).s, l, kv_A(refs, 0).l, &rv_path, 1, verbose);
 
       strand = '+';
@@ -1042,12 +1100,6 @@ int main(int argc, char *argv[]) {
       printf("Path length: %d\n", kv_size(path));
       float acc = cigar_accuracy(path.a, kv_size(path));
       printf("Accuracy: %f\n", acc);
-    }
-
-    else {
-      fprintf(stderr, "ERROR: unknown method '%s'\n", method);
-      usage();
-      return 1;
     }
   }
 
